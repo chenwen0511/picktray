@@ -138,3 +138,46 @@ test/output_picktray_demo/results/vlm_roi.json
 - `VLM` 只负责“指目标区域”，不直接输出最终 mask。
 - `SAM3` 负责“产出候选实例”，最终由 `ROI` 交集规则决定留下哪一个实例。
 - 后续如果要接 `depth + K + CAD` 做位姿估计，应直接使用这里筛选后的 `detection_ism.json` 或 `mask_instances.png`。
+
+## 位姿估计默认流程
+
+`pose_pipeline.py` 的默认主流程是：
+
+1. `VLM` 在原图上提取目标 `bbox / ROI`
+2. `SAM3` 在原图上做实例分割
+3. 只保留与 `ROI` 交集面积最大的那个实例
+4. 用该实例的 `mask + depth + K + CAD` 继续做位姿估计
+
+也就是说，**默认情况下位姿估计会先调用分割**，再继续做 3D 配准；只有在你显式提供已有的 `--mask`、`--detection-ism` 或 `--seg-output-dir` 时，才会复用现成分割结果。
+
+### 位姿估计命令行示例
+
+默认一键流程：
+
+```bash
+python pose_pipeline.py \
+  --rgb test/inputs/rgb.png \
+  --depth test/inputs/depth.png \
+  --camera test/inputs/camera.json \
+  --mesh test/cad/tray_180mm_centered_mesh_v2.ply \
+  --output-dir test/output_pose_pipeline
+```
+
+这条命令默认会自动执行：
+
+- `VLM` 提取目标 `bbox / ROI`
+- `SAM3` 实例分割
+- ROI 筛选实例
+- 基于筛选实例做位姿估计
+
+如果你已经有现成分割输出，也可以显式复用：
+
+```bash
+python pose_pipeline.py \
+  --rgb test/inputs/rgb.png \
+  --depth test/inputs/depth.png \
+  --camera test/inputs/camera.json \
+  --mesh test/cad/tray_180mm_centered_mesh_v2.ply \
+  --seg-output-dir test/output_sam3_vlm \
+  --output-dir test/output_pose_pipeline_reuse_seg
+```
