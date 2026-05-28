@@ -4,7 +4,7 @@ VLM ROI + SAM3 原图分割 + ROI 交集筛选。
 流程见 ``vlm_seg.md``：
   ① 原图 ``rgb`` 跑 ``SAM3`` 得到实例
   ② 原图 ``rgb`` 跑 ``VLM`` 得到 ROI
-  ③ 仅保留与 ROI 交集面积最大的 instance，送入 FoundationPose
+  ③ 仅保留与 ROI 交集最大的 instance，送入 FoundationPose
 """
 
 from __future__ import annotations
@@ -326,8 +326,6 @@ class FilteredInstancesResult:
     kept_source_indices: List[int]
     intersection_pixels: Dict[int, int]
     raw_intersection_pixels: Dict[int, int]
-    instance_area_pixels: Dict[int, int]
-    raw_instance_area_pixels: Dict[int, int]
     roi_bbox_used: Tuple[int, int, int, int]
 
 
@@ -446,22 +444,18 @@ def _write_vlm_roi_json(
     kept_source_indices: List[int],
     intersection_pixels: Dict[int, int],
     raw_intersection_pixels: Dict[int, int],
-    instance_area_pixels: Dict[int, int],
-    raw_instance_area_pixels: Dict[int, int],
 ) -> Path:
     payload: Dict[str, Any] = {
         "use_vlm_roi_filter": roi is not None,
         "vlm_used": roi is not None,
         "min_intersection_px": _vlm_min_intersection_px(),
-        "selection_rule": "max_roi_intersection" if roi is not None else "passthrough_all_instances",
+        "selection_rule": "max_roi_intersection",
         "raw_detection_ism": str(raw_detection_json) if raw_detection_json else None,
         "filtered_detection_ism": str(filtered_detection_json) if filtered_detection_json else None,
         "kept_instance_ids": kept_instance_ids,
         "kept_source_indices": kept_source_indices,
         "intersection_pixels": {str(k): int(v) for k, v in intersection_pixels.items()},
         "raw_intersection_pixels": {str(k): int(v) for k, v in raw_intersection_pixels.items()},
-        "instance_area_pixels": {str(k): int(v) for k, v in instance_area_pixels.items()},
-        "raw_instance_area_pixels": {str(k): int(v) for k, v in raw_instance_area_pixels.items()},
     }
     if roi is not None:
         payload.update(
@@ -549,7 +543,7 @@ def filter_instances_by_roi_intersection(
     margin_px: Optional[int] = None,
 ) -> FilteredInstancesResult:
     """
-    解码 ``detection_ism.json`` 中每个实例 mask，只在与 ROI 有交集的实例中保留交集面积最大的实例。
+    解码 ``detection_ism.json`` 中每个实例 mask，只保留与 ROI 矩形区域交集最大的实例。
     """
     rgb_path = rgb_path.expanduser().resolve()
     detection_ism_path = detection_ism_path.expanduser().resolve()
@@ -570,32 +564,27 @@ def filter_instances_by_roi_intersection(
     roi_mask[y1 : y2 + 1, x1 : x2 + 1] = True
     decoded_masks = get_instance_bool_masks(raw_dets, (width, height))
 
-    candidates: List[Tuple[int, Dict[str, Any], np.ndarray, int, int, float]] = []
+    candidates: List[Tuple[int, Dict[str, Any], np.ndarray, int, float]] = []
     raw_intersection_pixels: Dict[int, int] = {}
-    raw_instance_area_pixels: Dict[int, int] = {}
     for idx, (det, inst_mask) in enumerate(zip(raw_dets, decoded_masks), start=1):
         intersection_px = int(np.count_nonzero(inst_mask & roi_mask))
-        area_px = int(np.count_nonzero(inst_mask))
         raw_intersection_pixels[idx] = intersection_px
-        raw_instance_area_pixels[idx] = area_px
         if intersection_px >= min_px:
             score = float(det.get("score", 0.0))
-            candidates.append((idx, det, inst_mask, intersection_px, area_px, score))
+            candidates.append((idx, det, inst_mask, intersection_px, score))
 
     if not candidates:
         raise RuntimeError("No SAM3 instances intersect VLM ROI")
 
-    # 先要求与 ROI 有交集；在候选里按 ROI 交集像素数降序选最大者。
-    # 若交集相同，则按检测分数、实例面积继续打破并列。
-    candidates.sort(key=lambda item: (item[3], item[5], item[4]), reverse=True)
-    source_idx, det, inst_mask, inter_px, area_px, score = candidates[0]
+    # 按 ROI 交集像素数降序；若并列，则按检测分数降序。
+    candidates.sort(key=lambda item: (item[3], item[4]), reverse=True)
+    source_idx, det, inst_mask, inter_px, score = candidates[0]
     composite = np.zeros((height, width), dtype=np.uint8)
     filtered_dets: List[Dict[str, Any]] = []
     filtered_scores: List[float] = []
     kept_instance_ids: List[int] = []
     kept_source_indices: List[int] = []
     intersection_pixels: Dict[int, int] = {}
-    instance_area_pixels: Dict[int, int] = {}
     fill = inst_mask & (composite == 0)
     if np.any(fill):
         composite[fill] = np.uint8(1)
@@ -604,7 +593,6 @@ def filter_instances_by_roi_intersection(
         kept_instance_ids.append(1)
         kept_source_indices.append(source_idx)
         intersection_pixels[1] = inter_px
-        instance_area_pixels[1] = area_px
 
     if not filtered_dets:
         raise RuntimeError("No SAM3 instances intersect VLM ROI")
@@ -651,8 +639,6 @@ def filter_instances_by_roi_intersection(
         kept_source_indices=kept_source_indices,
         intersection_pixels=intersection_pixels,
         raw_intersection_pixels=raw_intersection_pixels,
-        instance_area_pixels=instance_area_pixels,
-        raw_instance_area_pixels=raw_instance_area_pixels,
         roi_bbox_used=roi_bbox_used,
     )
 
@@ -710,8 +696,6 @@ def run_vlm_sam3_filter_pipeline(
             kept_source_indices=list(range(1, published.num_instances + 1)),
             intersection_pixels={},
             raw_intersection_pixels={},
-            instance_area_pixels={},
-            raw_instance_area_pixels={},
         )
         return VlmSam3FilterResult(
             sam3=published,
@@ -759,8 +743,6 @@ def run_vlm_sam3_filter_pipeline(
         kept_source_indices=filtered.kept_source_indices,
         intersection_pixels=filtered.intersection_pixels,
         raw_intersection_pixels=filtered.raw_intersection_pixels,
-        instance_area_pixels=filtered.instance_area_pixels,
-        raw_instance_area_pixels=filtered.raw_instance_area_pixels,
     )
 
     return VlmSam3FilterResult(

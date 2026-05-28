@@ -1,42 +1,43 @@
 """
-SAM3 text-prompt segmentation backend (subprocess).
+SAM3 text-prompt segmentation backend (REST HTTP).
 
-调用方式与在 ``sam3`` 仓库根目录下手动执行一致，例如::
+当前通过 SAM3 在线服务调用，例如::
 
-    /home/ubuntu/miniconda3/envs/sam3/bin/python \\
-        /home/ubuntu/stephen/01-code/sam3/scripts/infer.py \\
-        --image /path/to/rgb.png \\
-        --prompt "Plastic Reel" \\
-        --output-dir /path/to/output \\
-        --threshold 0.41 \\
-        --mask-threshold 0.50
+    curl -X POST http://127.0.0.1:18002/infer \
+      -H "Content-Type: application/json" \
+      -d '{
+        "image_path": "/path/to/rgb.png",
+        "prompt": "Plastic Reel",
+        "threshold": 0.41,
+        "mask_threshold": 0.50,
+        "save_vis": true,
+        "output_dir": "/path/to/output"
+      }'
 
-``infer.py`` 会写入 ``{output_dir}/sam6d_results/detection_ism.json``（FoundationPose HTTP 将
-``output_dir`` 设为每次请求的 ``service_outputs/<id>/``）。
+SAM3 服务会将结果写入 ``{output_dir}/sam6d_results/detection_ism.json``，本模块继续复用
+这些落盘结果生成 FoundationPose 需要的实例 mask 与可视化。
 
-环境变量（``GENPOSE2_SAM3_*`` 优先，其次 ``SAM6D_SAM3_*``）::
+默认配置见下方常量：
 
-    GENPOSE2_SAM3_ROOT / SAM6D_SAM3_ROOT
-    GENPOSE2_SAM3_PYTHON / SAM6D_SAM3_PYTHON
-    GENPOSE2_SAM3_INFER_SCRIPT / SAM6D_SAM3_INFER_SCRIPT
-    GENPOSE2_SAM3_PROMPT / SAM6D_SAM3_PROMPT
-    GENPOSE2_SAM3_THRESHOLD / SAM6D_SAM3_THRESHOLD
-    GENPOSE2_SAM3_MASK_THRESHOLD / SAM6D_SAM3_MASK_THRESHOLD
-    GENPOSE2_SAM3_CHECKPOINT / SAM6D_SAM3_CHECKPOINT  （可选，传给 infer.py --checkpoint）
+    DEFAULT_SAM3_API_URL
+    DEFAULT_SAM3_PROMPT
+    DEFAULT_SAM3_THRESHOLD
+    DEFAULT_SAM3_MASK_THRESHOLD
+    DEFAULT_SAM3_TIMEOUT_S
 """
 
 from __future__ import annotations
 
 import json
-import os
-import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
+import requests
 from PIL import Image
 
 _COCOMASK = None
@@ -65,23 +66,11 @@ def _cocomask():
         _COCOMASK = cocomask_mod
     return _COCOMASK
 
-DEFAULT_SAM3_ROOT = "/home/ubuntu/stephen/01-code/sam3"
-DEFAULT_SAM3_PYTHON = "/home/ubuntu/miniconda3/envs/sam3/bin/python"
-DEFAULT_SAM3_INFER_SCRIPT = "/home/ubuntu/stephen/01-code/sam3/scripts/infer.py"
-DEFAULT_SAM3_PROMPT = "Plastic Reel"
+DEFAULT_SAM3_API_URL = "http://127.0.0.1:18002/infer"
+DEFAULT_SAM3_PROMPT = "Plastic Reel Connected With Tape"
 DEFAULT_SAM3_THRESHOLD = 0.41
 DEFAULT_SAM3_MASK_THRESHOLD = 0.50
-DEFAULT_SAM3_CHECKPOINT = "/home/ubuntu/stephen/02-weight/sam3/sam3.pt"
-# 当前默认分割主流程为 ``VLM ROI -> SAM3 实例分割 -> ROI 筛选``。
-DEFAULT_VLM_ROI_MARGIN_PX = 10
-
-
-def _env_first(*keys: str, default: str = "") -> str:
-    for key in keys:
-        value = os.environ.get(key)
-        if value is not None and str(value).strip() != "":
-            return str(value).strip()
-    return default
+DEFAULT_SAM3_TIMEOUT_S = 300.0
 
 
 @dataclass
@@ -97,7 +86,7 @@ class Sam3SegmentationResult:
     vis_ism_path: Optional[Path] = None
 
 
-# 与 sam3/scripts/infer.py VIS_COLORS 一致（OpenCV BGR）
+# 与 SAM3 可视化颜色约定一致（OpenCV BGR）
 _VIS_COLORS_BGR: Tuple[Tuple[int, int, int], ...] = (
     (0, 255, 0),
     (0, 128, 255),
@@ -247,50 +236,60 @@ def _parse_sam3_output(work_dir: Path, rgb_path: Path) -> Tuple[np.ndarray, floa
     raise RuntimeError(f"no mask or json found under SAM3 output dir: {work_dir}")
 
 
-def _sam3_root() -> Path:
-    return Path(
-        _env_first("GENPOSE2_SAM3_ROOT", "SAM6D_SAM3_ROOT", default=DEFAULT_SAM3_ROOT)
-    ).expanduser().resolve()
+def _sam3_api_url() -> str:
+    return DEFAULT_SAM3_API_URL
 
 
-def _sam3_python() -> str:
-    py = _env_first("GENPOSE2_SAM3_PYTHON", "SAM6D_SAM3_PYTHON", default=DEFAULT_SAM3_PYTHON)
-    return str(Path(py).expanduser().resolve())
+def _sam3_health_url() -> str:
+    parsed = urlparse(_sam3_api_url())
+    path = parsed.path or "/infer"
+    if path.endswith("/infer"):
+        path = path[: -len("/infer")] + "/health"
+    else:
+        path = "/health"
+    return parsed._replace(path=path, params="", query="", fragment="").geturl()
 
 
-def _sam3_infer_script() -> Path:
-    script = _env_first(
-        "GENPOSE2_SAM3_INFER_SCRIPT",
-        "SAM6D_SAM3_INFER_SCRIPT",
-        default=DEFAULT_SAM3_INFER_SCRIPT,
-    )
-    path = Path(script).expanduser()
-    if path.is_file():
-        return path.resolve()
-    return (_sam3_root() / "scripts" / "infer.py").resolve()
+def _sam3_timeout_s() -> float:
+    return DEFAULT_SAM3_TIMEOUT_S
 
 
-def _sam3_checkpoint() -> Optional[str]:
-    ckpt = _env_first("GENPOSE2_SAM3_CHECKPOINT", "SAM6D_SAM3_CHECKPOINT", default="")
-    if not ckpt:
-        if Path(DEFAULT_SAM3_CHECKPOINT).is_file():
-            return DEFAULT_SAM3_CHECKPOINT
-        return None
-    return str(Path(ckpt).expanduser().resolve())
-
-
-def _validate_sam3_toolchain(python_exe: str, infer_script: Path) -> None:
-    py_path = Path(python_exe)
-    if not py_path.is_file():
-        raise FileNotFoundError(
-            f"SAM3 python 不存在: {py_path}\n"
-            f"请设置 GENPOSE2_SAM3_PYTHON 或 SAM6D_SAM3_PYTHON（默认 {DEFAULT_SAM3_PYTHON}）"
+def _validate_sam3_service_config(api_url: str) -> None:
+    parsed = urlparse(api_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(
+            f"SAM3 API URL 无效: {api_url!r}\n"
+            f"请检查 DEFAULT_SAM3_API_URL（当前默认 {DEFAULT_SAM3_API_URL}）"
         )
-    if not infer_script.is_file():
-        raise FileNotFoundError(
-            f"SAM3 infer.py 不存在: {infer_script}\n"
-            f"请设置 GENPOSE2_SAM3_INFER_SCRIPT 或 SAM6D_SAM3_INFER_SCRIPT"
-        )
+
+
+def check_sam3_service_health(*, timeout_s: float = 2.0) -> Dict[str, Any]:
+    api_url = _sam3_api_url()
+    health_url = _sam3_health_url()
+    _validate_sam3_service_config(api_url)
+    _validate_sam3_service_config(health_url)
+    try:
+        resp = requests.get(health_url, timeout=timeout_s)
+    except requests.RequestException as exc:
+        return {
+            "ok": False,
+            "api_url": api_url,
+            "health_url": health_url,
+            "error": str(exc),
+        }
+
+    payload: Dict[str, Any] = {
+        "ok": resp.ok,
+        "api_url": api_url,
+        "health_url": health_url,
+        "status_code": resp.status_code,
+    }
+    try:
+        payload["response"] = resp.json()
+    except ValueError:
+        text = resp.text.strip()
+        payload["response_text"] = text[:500] if text else ""
+    return payload
 
 
 def _decode_detection_mask(det: Dict[str, Any], image_size: Tuple[int, int]) -> np.ndarray:
@@ -506,94 +505,57 @@ def run_sam3_segmentation(
     prompt: Optional[str] = None,
     threshold: Optional[float] = None,
     mask_threshold: Optional[float] = None,
-    infer_script: Optional[Path] = None,
-    python_exe: Optional[str] = None,
     mask_exr_out: Optional[Path] = None,
     max_instances: int = 0,
 ) -> Sam3SegmentationResult:
     rgb_path = rgb_path.expanduser().resolve()
     output_dir = output_dir.expanduser().resolve()
-    sam3_root = _sam3_root()
-    script = (infer_script or _sam3_infer_script()).expanduser().resolve()
-    py = python_exe or _sam3_python()
-    _validate_sam3_toolchain(py, script)
+    api_url = _sam3_api_url()
+    _validate_sam3_service_config(api_url)
 
     prompt_text = (
         prompt
         if prompt is not None
-        else _env_first("GENPOSE2_SAM3_PROMPT", "SAM6D_SAM3_PROMPT", default=DEFAULT_SAM3_PROMPT)
+        else DEFAULT_SAM3_PROMPT
     )
     thresh = (
         float(threshold)
         if threshold is not None
-        else float(
-            _env_first(
-                "GENPOSE2_SAM3_THRESHOLD",
-                "SAM6D_SAM3_THRESHOLD",
-                default=str(DEFAULT_SAM3_THRESHOLD),
-            )
-        )
+        else float(DEFAULT_SAM3_THRESHOLD)
     )
     mask_thresh = (
         float(mask_threshold)
         if mask_threshold is not None
-        else float(
-            _env_first(
-                "GENPOSE2_SAM3_MASK_THRESHOLD",
-                "SAM6D_SAM3_MASK_THRESHOLD",
-                default=str(DEFAULT_SAM3_MASK_THRESHOLD),
-            )
-        )
+        else float(DEFAULT_SAM3_MASK_THRESHOLD)
     )
 
     sam6d_results = output_dir / "sam6d_results"
     sam6d_results.mkdir(parents=True, exist_ok=True)
     json_path = sam6d_results / "detection_ism.json"
 
-    # 与手动命令一致：python / abs/infer.py --image ... --output-dir <abs> ...
-    cmd = [
-        py,
-        str(script),
-        "--image",
-        str(rgb_path.resolve()),
-        "--prompt",
-        prompt_text,
-        "--output-dir",
-        str(output_dir.resolve()),
-        "--threshold",
-        str(thresh),
-        "--mask-threshold",
-        str(mask_thresh),
-    ]
-    checkpoint = _sam3_checkpoint()
-    if checkpoint:
-        cmd.extend(["--checkpoint", checkpoint])
-
-    print(f"[sam3_seg_backend] sam3_root(cwd)={sam3_root}")
-    print(f"[sam3_seg_backend] cmd: {' '.join(cmd)}")
-
-    env = os.environ.copy()
-    if os.environ.get("SAM6D_CUDA_VISIBLE_DEVICES"):
-        env["CUDA_VISIBLE_DEVICES"] = os.environ["SAM6D_CUDA_VISIBLE_DEVICES"]
+    payload = {
+        "image_path": str(rgb_path),
+        "prompt": prompt_text,
+        "threshold": float(thresh),
+        "mask_threshold": float(mask_thresh),
+        "save_vis": True,
+        "output_dir": str(output_dir),
+    }
+    print(f"[sam3_seg_backend] POST {api_url}")
+    print(f"[sam3_seg_backend] payload: {json.dumps(payload, ensure_ascii=False)}")
 
     t0 = time.perf_counter()
-    proc = subprocess.run(
-        cmd,
-        cwd=str(sam3_root),
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
+    try:
+        resp = requests.post(api_url, json=payload, timeout=_sam3_timeout_s())
+    except requests.RequestException as exc:
+        raise RuntimeError(f"SAM3 HTTP request failed: {exc}") from exc
     elapsed_ms = (time.perf_counter() - t0) * 1000.0
-    print(f"[sam3_seg_backend] elapsed_ms={elapsed_ms:.3f} returncode={proc.returncode}")
-    if proc.stdout:
-        print("[sam3_seg_backend] stdout tail:\n" + "\n".join(proc.stdout.splitlines()[-40:]))
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"SAM3 infer failed with exit code {proc.returncode}\n"
-            f"{proc.stdout[-4000:] if proc.stdout else ''}"
-        )
+    print(f"[sam3_seg_backend] elapsed_ms={elapsed_ms:.3f} status_code={resp.status_code}")
+    if not resp.ok:
+        body = resp.text[:4000] if resp.text else ""
+        raise RuntimeError(f"SAM3 HTTP infer failed: status={resp.status_code}\n{body}")
+    if resp.text:
+        print(f"[sam3_seg_backend] response head: {resp.text[:1000]}")
 
     if not json_path.is_file():
         print(f"[sam3_seg_backend] {json_path} missing, fallback parse under {output_dir}")
@@ -640,7 +602,7 @@ def run_sam3_segmentation(
         )
         visualize_sam3_mask_exr(rgb_path, mask_exr_out, vis_sam3_seg_path)
     elif vis_ism_path.is_file():
-        print(f"[sam3_seg_backend] keep subprocess vis_ism: {vis_ism_path}")
+        print(f"[sam3_seg_backend] keep existing vis_ism: {vis_ism_path}")
     else:
         print(f"[sam3_seg_backend] no instance_dets for vis, skip")
 
